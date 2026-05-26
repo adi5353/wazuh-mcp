@@ -147,6 +147,7 @@ from .tools import explain_alert as _explain_alert_module  # noqa: E402
 from .tools import roi as _roi_module  # noqa: E402
 from .tools import quick_wins as _quick_wins_module  # noqa: E402
 from .tools import metrics as _metrics_module  # noqa: E402
+from .tools import correlation as _correlation_module  # noqa: E402
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -235,6 +236,72 @@ _explain_alert_module.register(mcp, wz, idx, cfg, _cap, _geoip_lookup)
 _roi_module.register(mcp, wz, idx, cfg, _cap, _truncate)
 _quick_wins_module.register(mcp, wz, idx, cfg, _cap)
 _metrics_module.register(mcp, wz, idx, cfg, _cap, _truncate)
+_correlation_module.register(mcp, wz, idx, cfg, _cap)
+
+# ── MCP Resources (P3) ────────────────────────────────────────────────────────
+from . import resources as _resources_module  # noqa: E402
+_resources_module.register(mcp, wz, idx, cfg)
+
+# ── Enrichment pipeline tools (P3) ────────────────────────────────────────────
+
+@mcp.tool()
+async def enrich_alert_full(alert_id: str) -> dict:
+    """Fully enrich a single alert with GeoIP, MITRE details, agent context,
+    reputation (VirusTotal/AbuseIPDB), and historical rule frequency.
+
+    Runs all enrichers concurrently for minimal latency.
+
+    Args:
+        alert_id: Wazuh alert document ID (from get_alert_by_id or search_alerts).
+    """
+    from .rbac import require_role, ROLE
+    err = require_role(ROLE.ANALYST)
+    if err:
+        return err
+
+    try:
+        resp = await idx.search(
+            {"query": {"ids": {"values": [alert_id]}}, "size": 1}
+        )
+        hits = resp.get("hits", {}).get("hits", [])
+        if not hits:
+            return {"error": f"Alert '{alert_id}' not found"}
+        alert = hits[0].get("_source", {})
+        alert["_id"] = alert_id
+    except Exception as exc:
+        return {"error": f"Failed to fetch alert: {exc}"}
+
+    from .enrichment.pipeline import enrich_alert
+    enriched = await enrich_alert(alert, wz=wz, idx=idx, cfg=cfg)
+    return {"alert_id": alert_id, "enriched": enriched}
+
+
+@mcp.tool()
+async def enrich_alerts_batch(alert_ids: list, max_concurrent: int = 5) -> dict:
+    """Enrich a batch of alerts concurrently with the full enrichment pipeline.
+
+    Args:
+        alert_ids:      List of alert document IDs (up to 20).
+        max_concurrent: Maximum parallel enrichment workers. Default 5.
+    """
+    from .rbac import require_role, ROLE
+    err = require_role(ROLE.ANALYST)
+    if err:
+        return err
+
+    alert_ids = alert_ids[:20]
+    try:
+        resp = await idx.search(
+            {"query": {"ids": {"values": alert_ids}}, "size": len(alert_ids)}
+        )
+        hits = resp.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        return {"error": f"Failed to fetch alerts: {exc}"}
+
+    alerts = [{"_id": h["_id"], **h.get("_source", {})} for h in hits]
+    from .enrichment.pipeline import enrich_alerts_batch as _batch
+    enriched = await _batch(alerts, wz=wz, idx=idx, cfg=cfg, max_concurrent=max_concurrent)
+    return {"enriched_count": len(enriched), "alerts": enriched}
 
 
 # ── Session identity tool (Gap 1) ─────────────────────────────────────────────
@@ -699,6 +766,157 @@ Export final report with: email_compliance_report(framework="{framework}", recip
 
 
 # ============================================================================
+# P3 Prompts — executive summary, audit prep, post-incident review, onboarding
+# ============================================================================
+
+@mcp.prompt()
+def executive_summary(period: str = "7d") -> str:
+    """C-suite security posture summary — no jargon, business-risk framing."""
+    return f"""Generate a concise executive summary of the security posture for the last {period}.
+
+Gather this data first (run in parallel):
+  alert_summary(time_range="{period}", min_level=9)
+  vulnerability_summary(min_severity="Critical")
+  compliance_summary(framework="PCI-DSS")
+  active_response_effectiveness(time_range="{period}")
+  get_mitre_gaps()
+
+Then write a 1-page brief in plain English:
+
+HEADLINE:  One sentence — is the environment under active threat right now?
+
+KEY NUMBERS (table):
+  Critical alerts this {period}:   [n]
+  High-severity CVEs unpatched:    [n]
+  Agents monitored:                [n]
+  Automated blocks executed:       [n]
+
+TOP RISKS  (max 3, each in one sentence explaining business impact):
+  1. [Risk] — [what could go wrong for the business]
+  2. [Risk] — [what could go wrong for the business]
+  3. [Risk] — [what could go wrong for the business]
+
+REQUIRED ACTIONS  (owner + deadline):
+  • [Action] — Owner: [team] — Due: [timeframe]
+
+STATUS:  GREEN / YELLOW / RED — one sentence justification."""
+
+
+@mcp.prompt()
+def compliance_audit_prep(framework: str = "PCI-DSS", audit_date: str = "") -> str:
+    """Pre-audit checklist and gap analysis for compliance officers."""
+    deadline = f" (audit date: {audit_date})" if audit_date else ""
+    return f"""Prepare for a {framework} audit{deadline}.
+
+Step 1 — Current posture:
+  compliance_summary(framework="{framework}")
+  compliance_control_details(framework="{framework}")
+
+Step 2 — Evidence collection:
+  generate_compliance_report(framework="{framework}")
+  export_compliance_csv(framework="{framework}", time_range="30d")
+  verify_audit_log_integrity()
+  get_audit_log_stats()
+
+Step 3 — Access control evidence:
+  search_authentication_failures(time_range="30d")
+  list_privileged_escalations(time_range="30d")
+  get_credential_age()
+
+Step 4 — Configuration evidence:
+  fleet_sca_weakest_agents(limit=10)
+  critical_file_changes(time_range="30d")
+
+Step 5 — Gap analysis:
+  For each FAILED control from Step 1:
+    - List the specific requirement
+    - Describe the gap in one sentence
+    - Recommend remediation with priority (P0/P1/P2) and owner
+
+Output format:
+  READY FOR AUDIT:  YES / NO (with conditions)
+  CONTROLS PASSING: [n] / [total]
+  GAPS TO CLOSE BEFORE AUDIT: [prioritised list]
+  EVIDENCE PACKAGE: [list of exported files / report IDs]"""
+
+
+@mcp.prompt()
+def post_incident_review(incident_id: str = "", time_range: str = "48h") -> str:
+    """Structured post-mortem template for completed security incidents."""
+    target = f"incident {incident_id}" if incident_id else f"the most recent high-severity incident in the last {time_range}"
+    return f"""Conduct a post-incident review for {target}.
+
+1. TIMELINE RECONSTRUCTION
+   incident_timeline({'incident_id="' + incident_id + '"' if incident_id else f'time_range="{time_range}"'})
+   alert_timeline(time_range="{time_range}")
+
+2. SCOPE & IMPACT
+   blast_radius_analysis(time_range="{time_range}")
+   search_fim_alerts(time_range="{time_range}") — file changes during incident
+   get_agent_login_history — accounts accessed during incident window
+
+3. DETECTION ANALYSIS
+   get_mitre_gaps() — which tactics were NOT detected?
+   correlate_alerts(time_range="{time_range}") — were alerts correlated?
+   check_sla_breaches() — was response within SLA?
+
+4. RESPONSE EFFECTIVENESS
+   active_response_effectiveness(time_range="{time_range}")
+   get_playbook_status() — which playbooks ran?
+
+5. ROOT CAUSE
+   hunt_persistence_mechanisms(time_range="{time_range}") — initial foothold?
+   search_authentication_failures(time_range="{time_range}") — access vector?
+
+Format the output as:
+
+INCIDENT SUMMARY (2 sentences)
+TIMELINE (chronological bullet list)
+ROOT CAUSE (1 sentence)
+WHAT WENT WELL
+WHAT NEEDS IMPROVEMENT
+ACTION ITEMS (owner + deadline per item)
+DETECTION GAPS TO CLOSE"""
+
+
+@mcp.prompt()
+def new_analyst_onboarding() -> str:
+    """Guided environment tour for analysts joining a new Wazuh deployment."""
+    return """Welcome to the SOC. This prompt runs a guided tour of the Wazuh environment.
+Work through each step in order — each one builds understanding for the next.
+
+STEP 1 — Know your fleet:
+  list_agents() — how many agents? what OS mix?
+  list_groups() — what groups exist?
+  get_cluster_health() — is the cluster healthy?
+  Explain what you found in plain English.
+
+STEP 2 — Understand the alert landscape:
+  alert_summary(time_range="7d") — what are the top rules firing?
+  search_by_mitre() — which MITRE tactics are most active?
+  compare_alert_volume(current_range="7d", baseline_offset="7d") — is volume normal?
+
+STEP 3 — Know the vulnerabilities:
+  vulnerability_summary(min_severity="Critical") — what CVEs need attention?
+  prioritize_patches(top_n=5) — which systems to patch first?
+
+STEP 4 — Understand compliance posture:
+  compliance_summary(framework="PCI-DSS")
+  fleet_sca_weakest_agents(limit=5) — most misconfigured agents
+
+STEP 5 — Run your first threat hunt:
+  hunt_lateral_movement(time_range="24h")
+  hunt_persistence_mechanisms(time_range="24h")
+  Summarise any findings and rate them LOW / MEDIUM / HIGH.
+
+STEP 6 — Know your tools:
+  List the 5 MCP tools you'll use most often, with one sentence on when to use each.
+  Describe how to create an incident report and assign it in Jira.
+
+End with: "I am ready to take my first shift." and list 3 things you would watch for today."""
+
+
+# ============================================================================
 # Entry point — HTTP (SSE) or STDIO
 # ============================================================================
 
@@ -1094,12 +1312,20 @@ def main() -> None:
         )
         mcp_asgi = mcp.sse_app()
 
+        from .ws_alerts import ws_alerts_handler
+        from starlette.routing import WebSocketRoute
+        from starlette.websockets import WebSocket as _WS
+
+        async def _ws_alerts_endpoint(ws: _WS) -> None:
+            await ws_alerts_handler(ws, idx=idx, cfg=cfg)
+
         app = Starlette(
             routes=[
-                Route("/health",      health_check),
-                Route("/metrics",     metrics_endpoint),
-                Route("/openapi.json", openapi_endpoint),
-                Mount("/",            app=mcp_asgi),
+                Route("/health",           health_check),
+                Route("/metrics",          metrics_endpoint),
+                Route("/openapi.json",     openapi_endpoint),
+                WebSocketRoute("/ws/alerts", endpoint=_ws_alerts_endpoint),
+                Mount("/",                 app=mcp_asgi),
             ]
         )
 

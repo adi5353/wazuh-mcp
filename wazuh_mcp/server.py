@@ -21,17 +21,11 @@ Enhanced edition — adds:
 from __future__ import annotations
 
 import asyncio
-import datetime
-import ipaddress
 import json
 import logging
 import os
 import sys
 import time
-
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -45,6 +39,10 @@ from .rate_limit import RateLimitMiddleware
 from .helpers import trim_alert, trim_vuln, severities_at_or_above, time_window
 from .wazuh_client import WazuhClient
 from .wazuh_indexer import WazuhIndexer
+from .mitre_data import enrich_mitre_ids as _enrich_mitre_ids, _MITRE_MAP
+from .geo import geoip_lookup as _geoip_lookup
+from .triage import incident_recommendations as _incident_recommendations
+from .middleware import ToolMiddleware
 
 # ── Structured logging (structlog optional, stdlib fallback) ──────────────────
 try:
@@ -89,99 +87,13 @@ SERVER_START_TIME = time.time()
 
 mcp = FastMCP("wazuh")
 
-# ── Response sanitization wrapper (Gap 7 + Gap 9) ────────────────────────────
-# Intercept every @mcp.tool() registration so tool return values are sanitized
-# before reaching the LLM. Strips prompt injection tokens and plaintext secrets.
-_original_mcp_tool = mcp.tool
-
-
-def _sanitizing_tool_decorator(*args, **kwargs):
-    """Wrap mcp.tool() to enforce input sanitization and output sanitization on every tool.
-
-    Input pass:  screens all string/list/dict kwargs for injection patterns,
-                 length limits, and dangerous characters before the tool runs.
-    Output pass: strips prompt injection tokens, executable code, plaintext
-                 secrets, and PII from the result; caps oversized responses.
-    Covers dict, str, and list return types (previously only dict was handled).
-    """
-    import functools
-
-    decorator = _original_mcp_tool(*args, **kwargs)
-
-    def wrapping_decorator(fn):
-        @functools.wraps(fn)
-        async def sanitized_fn(*fn_args, **fn_kwargs):
-            # ── INPUT sanitization ────────────────────────────────────────────
-            clean_kwargs: dict = {}
-            for field, value in fn_kwargs.items():
-                try:
-                    clean_kwargs[field] = sanitize_input_value(value, field)
-                except ValueError as exc:
-                    locked_out = record_injection_attempt()
-                    msg = f"Input rejected: {exc}"
-                    if locked_out:
-                        msg += " [session locked to VIEWER after repeated violations]"
-                    return {"error": msg}
-
-            # ── Tool execution (with ROI timing) ─────────────────────────────
-            import time as _time
-            _t0 = _time.monotonic()
-            result = await fn(*fn_args, **clean_kwargs)
-            _duration = _time.monotonic() - _t0
-            try:
-                from .core.roi_tracker import record_call
-                record_call(fn.__name__, _duration)
-            except Exception:
-                pass
-            try:
-                from .tools.metrics import record_tool_call
-                record_tool_call(fn.__name__, _duration)
-            except Exception:
-                pass
-
-            # ── OUTPUT sanitization ───────────────────────────────────────────
-            if isinstance(result, dict):
-                result = sanitize_response(result)
-            elif isinstance(result, str):
-                result = _sanitize_string(result)
-            elif isinstance(result, list):
-                result = [
-                    sanitize_response(item) if isinstance(item, dict)
-                    else (_sanitize_string(item) if isinstance(item, str) else item)
-                    for item in result
-                ]
-
-            result = cap_response_size(result)
-            return result
-
-        return decorator(sanitized_fn)
-
-    return wrapping_decorator
-
-
-mcp.tool = _sanitizing_tool_decorator  # type: ignore[method-assign]
-
-# ── Tool registry for playbook engine (Gap 3) ─────────────────────────────────
+# ── Tool registry for playbook engine ────────────────────────────────────────
 # Maps tool_name → async callable so run_playbook can invoke tools directly.
 _TOOL_REGISTRY: dict[str, Any] = {}
-_original_tool_for_registry = mcp.tool
 
-
-def _registry_capturing_tool(*args, **kwargs):
-    """Wrap mcp.tool() to capture each registered function by name."""
-    decorator = _original_tool_for_registry(*args, **kwargs)
-
-    def capturing_decorator(fn):
-        result = decorator(fn)
-        import functools
-        # The original fn name is the tool name used in playbook steps
-        _TOOL_REGISTRY[fn.__name__] = fn
-        return result
-
-    return capturing_decorator
-
-
-mcp.tool = _registry_capturing_tool  # type: ignore[method-assign]
+# ── Single middleware: sanitization + registry capture (replaces two monkey-patches) ──
+_tool_mw = ToolMiddleware(mcp, _TOOL_REGISTRY)
+_tool_mw.install()
 
 # ── Domain tool modules ────────────────────────────────────────────────────────
 from .tools import agents as _agents_module  # noqa: E402
@@ -261,118 +173,9 @@ def _truncate(s: str | None, n: int = 300) -> str | None:
     return s if len(s) <= n else s[:n] + "…"
 
 
-# ── Inline MITRE technique ID → name/tactic table (no network call needed) ───
-_MITRE_MAP: dict[str, dict] = {
-    "T1003": {"name": "OS Credential Dumping",              "tactic": "Credential Access"},
-    "T1021": {"name": "Remote Services",                    "tactic": "Lateral Movement"},
-    "T1027": {"name": "Obfuscated Files or Information",    "tactic": "Defense Evasion"},
-    "T1053": {"name": "Scheduled Task/Job",                 "tactic": "Persistence"},
-    "T1055": {"name": "Process Injection",                  "tactic": "Defense Evasion"},
-    "T1059": {"name": "Command and Scripting Interpreter",  "tactic": "Execution"},
-    "T1068": {"name": "Exploitation for Privilege Escalation", "tactic": "Privilege Escalation"},
-    "T1071": {"name": "Application Layer Protocol",         "tactic": "Command and Control"},
-    "T1078": {"name": "Valid Accounts",                     "tactic": "Persistence"},
-    "T1082": {"name": "System Information Discovery",       "tactic": "Discovery"},
-    "T1083": {"name": "File and Directory Discovery",       "tactic": "Discovery"},
-    "T1098": {"name": "Account Manipulation",               "tactic": "Persistence"},
-    "T1105": {"name": "Ingress Tool Transfer",              "tactic": "Command and Control"},
-    "T1110": {"name": "Brute Force",                        "tactic": "Credential Access"},
-    "T1112": {"name": "Modify Registry",                    "tactic": "Defense Evasion"},
-    "T1190": {"name": "Exploit Public-Facing Application",  "tactic": "Initial Access"},
-    "T1219": {"name": "Remote Access Software",             "tactic": "Command and Control"},
-    "T1543": {"name": "Create or Modify System Process",    "tactic": "Persistence"},
-    "T1548": {"name": "Abuse Elevation Control Mechanism",  "tactic": "Privilege Escalation"},
-    "T1562": {"name": "Impair Defenses",                    "tactic": "Defense Evasion"},
-    "T1569": {"name": "System Services",                    "tactic": "Execution"},
-}
-
-
-def _enrich_mitre_ids(technique_ids: list) -> list:
-    enriched = []
-    for tid in technique_ids:
-        base_id = tid.split(".")[0]
-        info = _MITRE_MAP.get(base_id, {})
-        enriched.append({
-            "id": tid,
-            "name": info.get("name", "Unknown Technique"),
-            "tactic": info.get("tactic", "Unknown"),
-        })
-    return enriched
-
-
-def _incident_recommendations(techniques: list, severity: str, src_ips: list) -> list:
-    recs: list[str] = []
-    t = [x.lower() for x in techniques]
-    if severity in ("CRITICAL", "HIGH"):
-        recs.append("Isolate affected agents immediately and capture memory dumps if possible.")
-    if any(k in x for x in t for k in ("brute", "credential", "password")):
-        recs.append("Reset credentials for all accounts active on affected agents.")
-        recs.append("Enable MFA if not already enforced.")
-    if any(k in x for x in t for k in ("lateral", "remote")):
-        recs.append("Review SMB/RDP/WinRM connections from affected agents to peer systems.")
-    if any(k in x for x in t for k in ("persist", "scheduled", "registry")):
-        recs.append("Audit startup items, scheduled tasks, and registry run keys on affected agents.")
-    if src_ips:
-        recs.append(f"Block source IPs via CDB list or firewall: {', '.join(src_ips[:5])}")
-    if not recs:
-        recs.append("Review alerts manually and escalate if activity continues.")
-    return recs
-
-
-async def _geoip_lookup(ip: str) -> dict:
-    """GeoIP enrichment via HTTPS.
-
-    Provider priority:
-      1. ipinfo.io (HTTPS, set IPINFO_TOKEN for higher rate limits — 50k/mo free)
-      2. ip-api.com HTTPS batch endpoint (no key, 45 req/min on free tier)
-
-    Override provider with WAZUH_GEOIP_PROVIDER=ipinfo|ip-api.
-    """
-    try:
-        parsed = ipaddress.ip_address(ip)
-        if parsed.is_private or parsed.is_loopback:
-            return {"ip": ip, "geo": "private/local"}
-    except ValueError:
-        return {"ip": ip, "geo": "invalid_ip"}
-
-    provider = os.getenv("WAZUH_GEOIP_PROVIDER", "ipinfo").lower()
-
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            # ── ipinfo.io (HTTPS, preferred) ──────────────────────────────
-            if provider != "ip-api":
-                token = os.getenv("IPINFO_TOKEN", "")
-                url = f"https://ipinfo.io/{ip}/json"
-                params = {"token": token} if token else {}
-                r = await client.get(url, params=params)
-                if r.status_code == 200:
-                    data = r.json()
-                    if "bogon" not in data:
-                        return {
-                            "ip": ip,
-                            "country": data.get("country", ""),
-                            "city": data.get("city", ""),
-                            "isp": data.get("org", ""),
-                            "asn": data.get("org", ""),
-                        }
-
-            # ── ip-api.com HTTPS fallback ─────────────────────────────────
-            r = await client.get(
-                f"https://ip-api.com/json/{ip}",
-                params={"fields": "status,country,city,isp,as"},
-            )
-            data = r.json()
-            if data.get("status") == "success":
-                return {
-                    "ip": ip,
-                    "country": data.get("country", ""),
-                    "city": data.get("city", ""),
-                    "isp": data.get("isp", ""),
-                    "asn": data.get("as", ""),
-                }
-    except Exception:
-        pass
-    return {"ip": ip, "geo": "lookup_failed"}
+# _MITRE_MAP, _enrich_mitre_ids → wazuh_mcp/mitre_data.py
+# _geoip_lookup              → wazuh_mcp/geo.py
+# _incident_recommendations  → wazuh_mcp/triage.py
 
 
 # ── Register domain modules ────────────────────────────────────────────────────

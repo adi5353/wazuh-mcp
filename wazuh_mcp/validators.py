@@ -5,6 +5,7 @@ Indexer queries or Manager API calls.
 """
 from __future__ import annotations
 
+import os
 import re
 import ipaddress
 from typing import Any
@@ -206,6 +207,60 @@ def validate_es_value(value: str, field: str = "value") -> str:
     # Strip characters that could manipulate query_string or regex queries
     cleaned = re.sub(r'[/\\^${}()\[\]+?]', "", value)
     return cleaned.strip()
+
+
+def validate_active_response_target(src_ip: str | None) -> str | None:
+    """Return an error string if src_ip is in a protected CIDR range, else None.
+
+    Blocks active responses targeting private RFC-1918 ranges, localhost,
+    link-local, and any CIDRs listed in WAZUH_AR_BLOCKED_CIDRS (comma-separated).
+    This prevents accidental self-inflicted outages (e.g. blocking 8.8.8.8 or
+    a corporate gateway).
+
+    Returns None when the target is safe to act on.
+    """
+    if not src_ip:
+        return None
+
+    # Parse the target — reject unparseable values
+    try:
+        addr = ipaddress.ip_address(src_ip.strip())
+    except ValueError:
+        return f"Invalid src_ip '{src_ip}': must be a valid IPv4 or IPv6 address."
+
+    # Built-in protected networks (always blocked regardless of config)
+    _BUILTIN_PROTECTED: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
+        ipaddress.ip_network("10.0.0.0/8"),       # RFC 1918
+        ipaddress.ip_network("172.16.0.0/12"),     # RFC 1918
+        ipaddress.ip_network("192.168.0.0/16"),    # RFC 1918
+        ipaddress.ip_network("127.0.0.0/8"),       # loopback
+        ipaddress.ip_network("::1/128"),            # IPv6 loopback
+        ipaddress.ip_network("169.254.0.0/16"),    # link-local
+        ipaddress.ip_network("fe80::/10"),          # IPv6 link-local
+        ipaddress.ip_network("0.0.0.0/8"),          # "this" network
+        ipaddress.ip_network("255.255.255.255/32"), # broadcast
+    ]
+
+    # Operator-supplied additional protected CIDRs
+    _extra: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    raw_extra = os.getenv("WAZUH_AR_BLOCKED_CIDRS", "").strip()
+    for cidr in raw_extra.split(","):
+        cidr = cidr.strip()
+        if not cidr:
+            continue
+        try:
+            _extra.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            pass  # ignore malformed env var entries
+
+    for net in _BUILTIN_PROTECTED + _extra:
+        if addr in net:
+            return (
+                f"Active response blocked: target IP {src_ip} falls within "
+                f"protected range {net}. To override, remove the IP from "
+                f"WAZUH_AR_BLOCKED_CIDRS or review the target."
+            )
+    return None
 
 
 def validation_error(field: str, message: str) -> dict:

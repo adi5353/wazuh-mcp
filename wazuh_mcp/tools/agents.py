@@ -3,6 +3,7 @@ from __future__ import annotations
 from ..tool_context import ToolContext
 
 from ..rbac import responder_only, admin_only
+from ..validators import validate_active_response_target
 
 
 def register(ctx: ToolContext) -> None:
@@ -70,6 +71,13 @@ def register(ctx: ToolContext) -> None:
         err = responder_only()
         if err:
             return err
+
+        # Protect critical infrastructure — block requests targeting private/reserved IPs
+        src_ip_arg = (arguments or [None])[0] if arguments else None
+        ip_err = validate_active_response_target(src_ip_arg)
+        if ip_err:
+            return {"error": ip_err, "blocked": True}
+
         if dry_run:
             return {
                 "dry_run": True,

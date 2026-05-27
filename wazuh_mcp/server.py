@@ -1293,14 +1293,33 @@ def main() -> None:
         from contextlib import asynccontextmanager as _asynccontextmanager
         from .background import init_precomputer as _init_precomputer
 
+        async def _approval_cleanup_loop() -> None:
+            """Periodically evict stale approval tokens (runs every 5 minutes)."""
+            from .approval import approval_store as _approval_store
+            while True:
+                try:
+                    await asyncio.sleep(300)
+                    removed = _approval_store.expire_stale()
+                    if removed:
+                        log.info("Approval cleanup: removed %d stale token(s)", removed)
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    log.error("Approval cleanup error: %s", exc)
+
         @_asynccontextmanager
         async def _lifespan(app):
             _pc = _init_precomputer(_idx_proxy, cfg)
             _pc.start()
             log.info("Background AlertPrecomputer started")
+            _cleanup_task = asyncio.create_task(
+                _approval_cleanup_loop(), name="approval-cleanup"
+            )
+            log.info("Background approval token cleanup started (every 300s)")
             yield
             _pc.stop()
-            log.info("Background AlertPrecomputer stopped")
+            _cleanup_task.cancel()
+            log.info("Background AlertPrecomputer and approval cleanup stopped")
 
         from .ws_alerts import ws_alerts_handler
         from starlette.routing import WebSocketRoute

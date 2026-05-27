@@ -316,6 +316,11 @@ def register(ctx: ToolContext) -> None:
         agent_id = params.get("agent_id", "")
         src_ip   = params.get("src_ip")
 
+        from ..validators import validate_active_response_target
+        ip_err = validate_active_response_target(src_ip)
+        if ip_err:
+            return {"error": ip_err, "blocked": True, "token": token}
+
         ar_body: dict = {"command": command, "arguments": [src_ip] if src_ip else []}
         try:
             res = await wz.request(

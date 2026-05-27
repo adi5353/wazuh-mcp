@@ -21,6 +21,7 @@ from typing import Any, Optional
 import httpx
 
 from .config import Config
+from .circuit_breaker import wazuh_manager_breaker
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +99,21 @@ class WazuhClient:
         log.info("Wazuh Manager: authenticated, token cached")
 
     async def request(self, method: str, path: str, **kwargs: Any) -> dict:
+        if not wazuh_manager_breaker.allow():
+            s = wazuh_manager_breaker.status()
+            raise RuntimeError(
+                f"Wazuh Manager circuit breaker open — backend unavailable. "
+                f"Retry in {s['circuit_resets_in_seconds']}s."
+            )
+        try:
+            result = await self._request_impl(method, path, **kwargs)
+            wazuh_manager_breaker.record_success()
+            return result
+        except Exception:
+            wazuh_manager_breaker.record_failure()
+            raise
+
+    async def _request_impl(self, method: str, path: str, **kwargs: Any) -> dict:
         last_exc: BaseException = RuntimeError("unreachable")
         for attempt in range(_MAX_RETRIES + 1):
             try:
@@ -171,6 +187,21 @@ class WazuhClient:
         Automatically appends ?overwrite=true so existing files are replaced.
         Retries on transient network/5xx errors (same policy as request()).
         """
+        if not wazuh_manager_breaker.allow():
+            s = wazuh_manager_breaker.status()
+            raise RuntimeError(
+                f"Wazuh Manager circuit breaker open — backend unavailable. "
+                f"Retry in {s['circuit_resets_in_seconds']}s."
+            )
+        try:
+            result = await self._upload_xml_impl(path, xml_content, overwrite)
+            wazuh_manager_breaker.record_success()
+            return result
+        except Exception:
+            wazuh_manager_breaker.record_failure()
+            raise
+
+    async def _upload_xml_impl(self, path: str, xml_content: str, overwrite: bool) -> dict:
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
             try:

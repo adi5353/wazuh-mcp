@@ -45,14 +45,14 @@ def register(mcp: Any, wz: Any, idx: Any, cfg: Any, _cap: Any) -> None:
         body: dict = {
             "size": 500,
             "query": {"bool": {"filter": [
-                {"range": {"timestamp": {"gte": gte, "lte": lte}}},
+                {"range": {"@timestamp": {"gte": gte, "lte": lte}}},
             ]}},
             "_source": [
-                "id", "timestamp", "rule.id", "rule.description",
+                "@timestamp", "rule.id", "rule.description",
                 "rule.level", "rule.mitre.id", "rule.mitre.tactic",
                 "agent.id", "agent.name", "data.srcip",
             ],
-            "sort": [{"timestamp": {"order": "asc"}}],
+            "sort": [{"@timestamp": {"order": "asc"}}],
         }
 
         try:
@@ -100,7 +100,7 @@ def register(mcp: Any, wz: Any, idx: Any, cfg: Any, _cap: Any) -> None:
             c = Cluster[cluster_key]
             c["alerts"].append({
                 "id": hit.get("_id"),
-                "timestamp": src.get("timestamp"),
+                "timestamp": src.get("@timestamp"),
                 "rule_id": rule.get("id"),
                 "description": rule.get("description", ""),
                 "level": level,
@@ -184,15 +184,15 @@ def register(mcp: Any, wz: Any, idx: Any, cfg: Any, _cap: Any) -> None:
         body: dict = {
             "size": 1000,
             "query": {"bool": {"filter": [
-                {"range": {"timestamp": {"gte": gte, "lte": lte}}},
+                {"range": {"@timestamp": {"gte": gte, "lte": lte}}},
                 {"exists": {"field": "rule.mitre.tactic"}},
             ]}},
             "_source": [
-                "timestamp", "rule.id", "rule.description", "rule.level",
+                "@timestamp", "rule.id", "rule.description", "rule.level",
                 "rule.mitre.id", "rule.mitre.tactic",
                 "agent.id", "agent.name", "data.srcip",
             ],
-            "sort": [{"timestamp": {"order": "asc"}}],
+            "sort": [{"@timestamp": {"order": "asc"}}],
         }
 
         try:
@@ -227,7 +227,7 @@ def register(mcp: Any, wz: Any, idx: Any, cfg: Any, _cap: Any) -> None:
             pivot = data.get("srcip") or agent.get("name") or agent.get("id", "unknown")
             for tactic in tactics:
                 timeline[pivot].append({
-                    "timestamp": src.get("timestamp"),
+                    "timestamp": src.get("@timestamp"),
                     "tactic": tactic,
                     "rule_id": rule.get("id"),
                     "description": rule.get("description", "")[:120],
